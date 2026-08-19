@@ -167,6 +167,22 @@ func (this *rateLimitMemcacheImpl) DoLimit(
 	return responseDescriptorStatuses
 }
 
+// memcachedMaxRelativeExpirationSeconds is the largest expiration value memcached treats as a
+// relative offset in seconds. Per the memcached protocol, any expiration greater than 30 days
+// is instead interpreted as an absolute Unix timestamp.
+// See https://github.com/memcached/memcached/blob/master/doc/protocol.txt ("Expiration times").
+const memcachedMaxRelativeExpirationSeconds = 60 * 60 * 24 * 30
+
+// memcacheExpiration converts a relative expiration in seconds into the value memcached expects,
+// converting to an absolute Unix timestamp when the relative value would exceed memcached's
+// 30-day threshold (e.g. calendar-aligned MONTH limits in 31-day months).
+func (this *rateLimitMemcacheImpl) memcacheExpiration(expirationSeconds int64) int32 {
+	if expirationSeconds > memcachedMaxRelativeExpirationSeconds {
+		return int32(this.timeSource.UnixNow() + expirationSeconds)
+	}
+	return int32(expirationSeconds)
+}
+
 func (this *rateLimitMemcacheImpl) increaseAsync(cacheKeys []limiter.CacheKey, isOverLimitWithLocalCache []bool,
 	limits []*config.RateLimit, hitsAddends []utils.HitsAddend,
 ) {
@@ -187,7 +203,7 @@ func (this *rateLimitMemcacheImpl) increaseAsync(cacheKeys []limiter.CacheKey, i
 
 		_, err := this.client.Increment(cacheKey.Key, hitsAddends[i].Value)
 		if err == memcache.ErrCacheMiss {
-			expirationSeconds := utils.UnitToDivider(limits[i].Limit.Unit)
+			expirationSeconds := this.baseRateLimiter.ExpirationSeconds(limits[i].Limit.Unit)
 			if this.expirationJitterMaxSeconds > 0 {
 				expirationSeconds += this.jitterRand.Int63n(this.expirationJitterMaxSeconds)
 			}
@@ -196,7 +212,7 @@ func (this *rateLimitMemcacheImpl) increaseAsync(cacheKeys []limiter.CacheKey, i
 			err = this.client.Add(&memcache.Item{
 				Key:        cacheKey.Key,
 				Value:      []byte(strconv.FormatUint(hitsAddends[i].Value, 10)),
-				Expiration: int32(expirationSeconds),
+				Expiration: this.memcacheExpiration(expirationSeconds),
 			})
 			if err == memcache.ErrNotStored {
 				// There was a race condition to do this add. We should be able to increment
@@ -330,6 +346,7 @@ func runAsync(task func()) {
 
 func NewRateLimitCacheImpl(client Client, timeSource utils.TimeSource, jitterRand *rand.Rand,
 	expirationJitterMaxSeconds int64, localCache *freecache.Cache, statsManager stats.Manager, nearLimitRatio float32, cacheKeyPrefix string,
+	useCalendarMonth bool,
 ) limiter.RateLimitCache {
 	return &rateLimitMemcacheImpl{
 		client:                     client,
@@ -338,7 +355,7 @@ func NewRateLimitCacheImpl(client Client, timeSource utils.TimeSource, jitterRan
 		expirationJitterMaxSeconds: expirationJitterMaxSeconds,
 		localCache:                 localCache,
 		nearLimitRatio:             nearLimitRatio,
-		baseRateLimiter:            limiter.NewBaseRateLimit(timeSource, jitterRand, expirationJitterMaxSeconds, localCache, nearLimitRatio, cacheKeyPrefix, statsManager),
+		baseRateLimiter:            limiter.NewBaseRateLimit(timeSource, jitterRand, expirationJitterMaxSeconds, localCache, nearLimitRatio, cacheKeyPrefix, statsManager, useCalendarMonth),
 	}
 }
 
@@ -354,5 +371,6 @@ func NewRateLimitCacheImplFromSettings(s settings.Settings, timeSource utils.Tim
 		statsManager,
 		s.NearLimitRatio,
 		s.CacheKeyPrefix,
+		s.UseCalendarMonthRateLimit,
 	)
 }
